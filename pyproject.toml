@@ -1,0 +1,13 @@
+[project]
+name = "apiguard"
+version = "0.1.0"
+description = "Detect breaking changes between OpenAPI JSON contracts"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[project.scripts]
+apiguard = "apiguard:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
