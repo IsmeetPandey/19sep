@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 HTTP_METHODS = {"get", "put", "post", "patch", "delete", "options", "head", "trace"}
+
 
 @dataclass(frozen=True)
 class Change:
@@ -20,11 +22,14 @@ class Change:
     def breaking(self) -> bool:
         return self.kind.startswith("BREAKING")
 
+    def as_dict(self) -> dict[str, Any]:
+        return {**asdict(self), "breaking": self.breaking}
 
-def load(path: Path) -> dict:
+
+def load(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read OpenAPI JSON: {exc}") from exc
     if not isinstance(data, dict) or not isinstance(data.get("paths"), dict):
         raise ValueError("document must be an OpenAPI JSON object with a 'paths' object")
@@ -33,7 +38,21 @@ def load(path: Path) -> dict:
     return data
 
 
-def compare(old: dict, new: dict) -> list[Change]:
+def _parameters(path_item: dict[str, Any], operation: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    """Return effective parameters; operation-level entries override path-level entries."""
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+    for source in (path_item.get("parameters", []), operation.get("parameters", [])):
+        if not isinstance(source, list):
+            continue
+        for parameter in source:
+            if not isinstance(parameter, dict):
+                continue
+            key = (str(parameter.get("in", "")), str(parameter.get("name", "")))
+            result[key] = parameter
+    return result
+
+
+def compare(old: dict[str, Any], new: dict[str, Any]) -> list[Change]:
     changes: list[Change] = []
     old_paths, new_paths = old["paths"], new["paths"]
 
@@ -57,63 +76,132 @@ def compare(old: dict, new: dict) -> list[Change]:
             o_op, n_op = o_item[method], n_item[method]
             if not isinstance(o_op, dict) or not isinstance(n_op, dict):
                 continue
-            _compare_parameters(o_op, n_op, loc, changes)
+            _compare_parameters(o_item, o_op, n_item, n_op, loc, changes)
             _compare_request_body(o_op, n_op, loc, changes)
             _compare_responses(o_op, n_op, loc, changes)
     return changes
 
 
-def _compare_parameters(old_op: dict, new_op: dict, loc: str, changes: list[Change]) -> None:
-    def key(p: dict) -> tuple[str, str]:
-        return (str(p.get("in", "")), str(p.get("name", "")))
-    old_params = {key(p): p for p in old_op.get("parameters", []) if isinstance(p, dict)}
-    new_params = {key(p): p for p in new_op.get("parameters", []) if isinstance(p, dict)}
-    for p in sorted(old_params.keys() - new_params.keys()):
-        changes.append(Change("BREAKING: removed parameter", loc, f"{p[0]} parameter '{p[1]}' was removed"))
-    for p in sorted(old_params.keys() & new_params.keys()):
-        if old_params[p].get("required") is not True and new_params[p].get("required") is True:
-            changes.append(Change("BREAKING: required parameter", loc, f"existing {p[0]} parameter '{p[1]}' became required"))
-    for p in sorted(new_params.keys() - old_params.keys()):
-        if new_params[p].get("required") is True:
-            changes.append(Change("BREAKING: required parameter", loc, f"new required {p[0]} parameter '{p[1]}'"))
+def _compare_parameters(
+    old_item: dict[str, Any],
+    old_op: dict[str, Any],
+    new_item: dict[str, Any],
+    new_op: dict[str, Any],
+    loc: str,
+    changes: list[Change],
+) -> None:
+    old_params = _parameters(old_item, old_op)
+    new_params = _parameters(new_item, new_op)
+    for parameter in sorted(old_params.keys() - new_params.keys()):
+        changes.append(
+            Change(
+                "BREAKING: removed parameter",
+                loc,
+                f"{parameter[0]} parameter '{parameter[1]}' was removed",
+            )
+        )
+    for parameter in sorted(old_params.keys() & new_params.keys()):
+        old_required = old_params[parameter].get("required") is True
+        new_required = new_params[parameter].get("required") is True
+        if not old_required and new_required:
+            changes.append(
+                Change(
+                    "BREAKING: required parameter",
+                    loc,
+                    f"existing {parameter[0]} parameter '{parameter[1]}' became required",
+                )
+            )
+    for parameter in sorted(new_params.keys() - old_params.keys()):
+        required = new_params[parameter].get("required") is True
+        if required:
+            changes.append(
+                Change(
+                    "BREAKING: required parameter",
+                    loc,
+                    f"new required {parameter[0]} parameter '{parameter[1]}'",
+                )
+            )
         else:
-            changes.append(Change("ADDED: parameter", loc, f"optional {p[0]} parameter '{p[1]}'"))
+            changes.append(
+                Change(
+                    "ADDED: parameter",
+                    loc,
+                    f"optional {parameter[0]} parameter '{parameter[1]}'",
+                )
+            )
 
 
-def _compare_request_body(old_op: dict, new_op: dict, loc: str, changes: list[Change]) -> None:
+def _compare_request_body(old_op: dict[str, Any], new_op: dict[str, Any], loc: str, changes: list[Change]) -> None:
     old_body, new_body = old_op.get("requestBody"), new_op.get("requestBody")
     if old_body and not new_body:
         changes.append(Change("BREAKING: removed request body", loc, "request body was removed"))
     if not old_body and isinstance(new_body, dict) and new_body.get("required"):
         changes.append(Change("BREAKING: required request body", loc, "request body was introduced as required"))
-    if isinstance(old_body, dict) and isinstance(new_body, dict) and not old_body.get("required") and new_body.get("required"):
-        changes.append(Change("BREAKING: request body required", loc, "request body changed from optional to required"))
+    if isinstance(old_body, dict) and isinstance(new_body, dict):
+        if not old_body.get("required") and new_body.get("required"):
+            changes.append(Change("BREAKING: request body required", loc, "request body changed from optional to required"))
 
 
-def _compare_responses(old_op: dict, new_op: dict, loc: str, changes: list[Change]) -> None:
-    old_resp, new_resp = old_op.get("responses", {}), new_op.get("responses", {})
+def _compare_responses(old_op: dict[str, Any], new_op: dict[str, Any], loc: str, changes: list[Change]) -> None:
+    old_resp = old_op.get("responses", {})
+    new_resp = new_op.get("responses", {})
+    if not isinstance(old_resp, dict) or not isinstance(new_resp, dict):
+        return
     for code in sorted(old_resp.keys() - new_resp.keys()):
         changes.append(Change("BREAKING: removed response", loc, f"response '{code}' was removed"))
     for code in sorted(new_resp.keys() - old_resp.keys()):
         changes.append(Change("ADDED: response", loc, f"response '{code}' was added"))
 
 
+def render_json(changes: list[Change]) -> str:
+    payload = {
+        "summary": {
+            "breaking": sum(change.breaking for change in changes),
+            "changes": len(changes),
+        },
+        "changes": [change.as_dict() for change in changes],
+    }
+    return json.dumps(payload, indent=2, sort_keys=False)
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="apiguard", description="Find breaking changes between OpenAPI JSON specs.")
+    parser = argparse.ArgumentParser(
+        prog="apiguard",
+        description="Find breaking changes between OpenAPI JSON specs.",
+    )
     parser.add_argument("old", type=Path)
     parser.add_argument("new", type=Path)
+    parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="output format (default: text)",
+    )
+    parser.add_argument(
+        "--fail-on",
+        choices=("breaking", "change"),
+        default="breaking",
+        help="exit 1 on breaking changes or on any detected change (default: breaking)",
+    )
     args = parser.parse_args(argv)
+
     try:
         changes = compare(load(args.old), load(args.new))
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if not changes:
+
+    if args.format == "json":
+        print(render_json(changes))
+    elif not changes:
         print("No API surface changes detected.")
-        return 0
-    for change in changes:
-        print(f"{change.kind} | {change.location} | {change.detail}")
-    return 1 if any(c.breaking for c in changes) else 0
+    else:
+        for change in changes:
+            print(f"{change.kind} | {change.location} | {change.detail}")
+
+    should_fail = bool(changes) if args.fail_on == "change" else any(change.breaking for change in changes)
+    return 1 if should_fail else 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
